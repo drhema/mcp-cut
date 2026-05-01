@@ -1,0 +1,31 @@
+1
+00:00:00,500 --> 00:00:03,200
+Welcome back to the channel friends
+
+2
+00:00:03,300 --> 00:00:06,500
+Today we are exploring something new
+
+3
+00:00:06,600 --> 00:00:09,400
+This caption tool runs through MCP
+
+4
+00:00:09,500 --> 00:00:12,800
+Each spoken word gets a yellow highlight
+
+5
+00:00:12,900 --> 00:00:16,000
+Built with Python and the CapCut schema
+
+6
+00:00:16,100 --> 00:00:19,500
+Hope you find this approach useful
+
+7
+00:00:19,600 --> 00:00:22,800
+Subscribe for more tutorials like this
+
+8
+00:00:22,900 --> 00:00:26,500
+Drop a comment with what to build next
