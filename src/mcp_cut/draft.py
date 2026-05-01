@@ -6,6 +6,7 @@ draft new_version 151.0.0, version 360000). Time units are microseconds.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
@@ -15,6 +16,7 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -2159,3 +2161,360 @@ def add_captions_from_srt(
         "first_start_seconds": captions[0][0] / US_PER_S + time_offset_seconds,
         "last_end_seconds": captions[-1][1] / US_PER_S + time_offset_seconds,
     }
+
+
+# ---- timeline cuts ---------------------------------------------------------
+
+def _merge_time_ranges_us(
+    ranges: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Coalesce overlapping/adjacent ranges. Sorted ascending by start."""
+    if not ranges:
+        return []
+    sorted_r = sorted(ranges, key=lambda r: r[0])
+    merged: list[tuple[int, int]] = [sorted_r[0]]
+    for s, e in sorted_r[1:]:
+        if s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def _compute_shift(position_us: int, cuts: list[tuple[int, int]]) -> int:
+    """Total cut duration that lands BEFORE `position_us`."""
+    shift = 0
+    for cut_start, cut_end in cuts:
+        if cut_end <= position_us:
+            shift += cut_end - cut_start
+        elif cut_start < position_us:
+            shift += position_us - cut_start
+    return shift
+
+
+def _apply_cuts_to_segments(
+    segments: list[dict[str, Any]],
+    cuts: list[tuple[int, int]],
+    track_type: str,
+) -> list[dict[str, Any]]:
+    """Subtract `cuts` from each segment's time span; split crossings;
+    shift the survivors left by the total cut duration before them.
+
+    Logic ported from sun-guannan/capcut-ai-editor (smartcut). source_timerange
+    is adjusted only for video/audio (text source_timerange is null).
+    """
+    surviving: list[dict[str, Any]] = []
+    for seg in segments:
+        target = seg.get("target_timerange", {}) or {}
+        seg_start = target.get("start", 0)
+        seg_dur = target.get("duration", 0)
+        seg_end = seg_start + seg_dur
+        if seg_dur <= 0:
+            continue
+
+        pieces: list[tuple[int, int]] = [(seg_start, seg_end)]
+        for cut_start, cut_end in cuts:
+            new_pieces: list[tuple[int, int]] = []
+            for ps, pe in pieces:
+                if cut_end <= ps or cut_start >= pe:
+                    new_pieces.append((ps, pe))
+                else:
+                    if ps < cut_start:
+                        new_pieces.append((ps, cut_start))
+                    if pe > cut_end:
+                        new_pieces.append((cut_end, pe))
+            pieces = new_pieces
+
+        if not pieces:
+            continue
+
+        source = seg.get("source_timerange")
+        has_source = isinstance(source, dict)
+        source_start_us = source.get("start", 0) if has_source else 0
+
+        for piece_start, piece_end in pieces:
+            piece_dur = piece_end - piece_start
+            if piece_dur <= 0:
+                continue
+            new_seg = copy.deepcopy(seg)
+            new_seg["id"] = _uuid()
+            shift = _compute_shift(piece_start, cuts)
+            new_seg["target_timerange"] = {
+                "start": piece_start - shift,
+                "duration": piece_dur,
+            }
+            if has_source and track_type in ("video", "audio"):
+                offset_from_seg_start = piece_start - seg_start
+                new_seg["source_timerange"] = {
+                    "start": source_start_us + offset_from_seg_start,
+                    "duration": piece_dur,
+                }
+            surviving.append(new_seg)
+    return surviving
+
+
+def remove_time_ranges(
+    name: str,
+    ranges_seconds: list[tuple[float, float]],
+) -> dict[str, Any]:
+    """Cut `(start_seconds, end_seconds)` ranges out of the timeline across
+    every track and shift remaining segments left to close the gaps.
+
+    Use cases: trim an intro, remove dead air, splice out mistakes, drop
+    a section the LLM identified.
+
+    Ranges are merged if they overlap. Segments that span a cut boundary
+    are split. Segments fully inside a cut are removed. Orphan materials
+    are garbage-collected after.
+    """
+    if not ranges_seconds:
+        return {"cut_count": 0, "total_cut_seconds": 0.0}
+
+    cuts_us: list[tuple[int, int]] = []
+    for s, e in ranges_seconds:
+        if e <= s:
+            raise DraftError(f"invalid range: ({s}, {e}) — end must exceed start")
+        cuts_us.append((int(s * US_PER_S), int(e * US_PER_S)))
+    cuts_us = _merge_time_ranges_us(cuts_us)
+
+    folder, info, meta = _load(name)
+    for track in info.get("tracks", []):
+        track["segments"] = _apply_cuts_to_segments(
+            track.get("segments", []), cuts_us, track.get("type", ""),
+        )
+    _gc_orphan_materials(info)
+    _save(folder, info, meta)
+
+    total_cut_us = sum(e - s for s, e in cuts_us)
+    return {
+        "cut_count": len(cuts_us),
+        "total_cut_seconds": total_cut_us / US_PER_S,
+        "new_duration_seconds": info["duration"] / US_PER_S,
+        "ranges_cut": [
+            {"start_seconds": s / US_PER_S, "end_seconds": e / US_PER_S}
+            for s, e in cuts_us
+        ],
+    }
+
+
+# ---- auto-caption reading --------------------------------------------------
+
+def get_auto_captions(name: str) -> list[dict[str, Any]]:
+    """Read CapCut's auto-generated captions out of an existing draft.
+
+    CapCut populates auto-captions when the user runs Text → Auto Captions.
+    Detection: text materials with `recognize_task_id != ""`. Word-level
+    timing lives in `materials.texts[].words.{text, start_time, end_time}`
+    where times are MILLISECONDS relative to the segment start (not the
+    microseconds the rest of the schema uses).
+
+    Returns a list sorted by timeline position with per-word timings
+    converted to absolute seconds for convenience.
+    """
+    folder, info, meta = _load(name)
+
+    materials_by_id: dict[str, dict[str, Any]] = {}
+    for mat in info.get("materials", {}).get("texts", []):
+        recognize_id = mat.get("recognize_task_id", "")
+        if not recognize_id:
+            continue
+        try:
+            display_text = json.loads(mat.get("content", "{}")).get("text", "")
+        except json.JSONDecodeError:
+            display_text = ""
+        words = mat.get("words", {}) or {}
+        materials_by_id[mat.get("id", "")] = {
+            "text": display_text,
+            "words_text": words.get("text", []),
+            "words_start_ms": words.get("start_time", []),
+            "words_end_ms": words.get("end_time", []),
+            "recognize_task_id": recognize_id,
+        }
+
+    if not materials_by_id:
+        return []
+
+    out: list[dict[str, Any]] = []
+    for track in info.get("tracks", []):
+        if track.get("type") != "text":
+            continue
+        for seg in track.get("segments", []):
+            mid = seg.get("material_id", "")
+            mat_data = materials_by_id.get(mid)
+            if not mat_data:
+                continue
+            target = seg.get("target_timerange", {}) or {}
+            start_us = target.get("start", 0)
+            dur_us = target.get("duration", 0)
+            words: list[dict[str, Any]] = []
+            n = min(
+                len(mat_data["words_text"]),
+                len(mat_data["words_start_ms"]),
+                len(mat_data["words_end_ms"]),
+            )
+            for i in range(n):
+                # Word timings are MS relative to segment start.
+                ws_us = int(mat_data["words_start_ms"][i]) * 1000 + start_us
+                we_us = int(mat_data["words_end_ms"][i]) * 1000 + start_us
+                words.append({
+                    "text": mat_data["words_text"][i],
+                    "start_seconds": ws_us / US_PER_S,
+                    "end_seconds": we_us / US_PER_S,
+                })
+            out.append({
+                "segment_id": seg.get("id", ""),
+                "material_id": mid,
+                "text": mat_data["text"],
+                "start_seconds": start_us / US_PER_S,
+                "end_seconds": (start_us + dur_us) / US_PER_S,
+                "duration_seconds": dur_us / US_PER_S,
+                "words": words,
+            })
+
+    out.sort(key=lambda x: x["start_seconds"])
+    return out
+
+
+# ---- smart cut: silences + duplicate takes ---------------------------------
+
+def _normalize_text(text: str) -> str:
+    text = text.lower().strip()
+    text = re.sub(r"[^\w\s]", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def _compute_text_similarity(a: str, b: str) -> float:
+    """Max of Jaccard word overlap and SequenceMatcher ratio."""
+    na, nb = _normalize_text(a), _normalize_text(b)
+    if not na or not nb:
+        return 0.0
+    wa, wb = set(na.split()), set(nb.split())
+    if not wa or not wb:
+        return 0.0
+    jaccard = len(wa & wb) / len(wa | wb)
+    seq = SequenceMatcher(None, na, nb).ratio()
+    return max(jaccard, seq)
+
+
+def _find_duplicate_takes(
+    subs: list[dict[str, Any]], threshold: float,
+) -> list[tuple[int, int]]:
+    """Detect "restart points" — where speaker started a phrase over.
+
+    Walks the subtitle list; for each subtitle, scans ahead for a later
+    subtitle whose text is similar enough (>= threshold) to count as
+    a restart. Cuts the span from the first abandoned attempt to the
+    start of the kept (latest) version.
+    """
+    if len(subs) < 2:
+        return []
+    cuts: list[tuple[int, int]] = []
+    i = 0
+    while i < len(subs):
+        last_restart = None
+        for j in range(i + 1, len(subs)):
+            if _compute_text_similarity(subs[i]["text"], subs[j]["text"]) >= threshold:
+                last_restart = j
+        if last_restart is not None:
+            cuts.append((subs[i]["start_us"], subs[last_restart]["start_us"]))
+            i = last_restart
+        else:
+            i += 1
+    return cuts
+
+
+def smart_cut_draft(
+    name: str,
+    silence_threshold_seconds: float = 1.0,
+    duplicate_similarity_threshold: float = 0.6,
+    cut_silences: bool = True,
+    cut_duplicates: bool = True,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Heuristic auto-edit for talking-head drafts.
+
+    Reads CapCut's auto-generated captions, finds:
+      * silences = subtitle gaps longer than `silence_threshold_seconds`
+        (plus dead air before the first and after the last subtitle)
+      * duplicate takes = sequences where the speaker re-recorded a
+        phrase; earlier attempts get cut, the last version is kept
+
+    Then removes the union of all those time ranges from every track.
+    `dry_run=True` returns the summary without modifying the draft.
+
+    Requires the user to have run "Text → Auto Captions" on the draft
+    in CapCut first (no captions found → DraftError).
+
+    Algorithm ported from sun-guannan/capcut-ai-editor.
+    """
+    if not (cut_silences or cut_duplicates):
+        raise DraftError("at least one of cut_silences/cut_duplicates must be True")
+
+    captions = get_auto_captions(name)
+    if not captions:
+        raise DraftError(
+            f"draft '{name}' has no auto-generated subtitles. Open it in "
+            "CapCut, run Text → Auto Captions, save, then retry."
+        )
+
+    folder, info, meta = _load(name)
+    duration_us = info.get("duration", 0)
+
+    subs = [
+        {
+            "text": c["text"],
+            "start_us": int(c["start_seconds"] * US_PER_S),
+            "end_us": int(c["end_seconds"] * US_PER_S),
+        }
+        for c in captions
+    ]
+    silence_us = int(silence_threshold_seconds * US_PER_S)
+
+    silence_cuts: list[tuple[int, int]] = []
+    duplicate_cuts: list[tuple[int, int]] = []
+
+    if cut_silences:
+        if subs[0]["start_us"] > 0:
+            silence_cuts.append((0, subs[0]["start_us"]))
+        for i in range(len(subs) - 1):
+            gap = subs[i + 1]["start_us"] - subs[i]["end_us"]
+            if gap > silence_us:
+                silence_cuts.append((subs[i]["end_us"], subs[i + 1]["start_us"]))
+        if duration_us > 0 and subs[-1]["end_us"] < duration_us:
+            silence_cuts.append((subs[-1]["end_us"], duration_us))
+
+    if cut_duplicates:
+        duplicate_cuts = _find_duplicate_takes(subs, duplicate_similarity_threshold)
+
+    merged = _merge_time_ranges_us(silence_cuts + duplicate_cuts)
+    total_cut_us = sum(e - s for s, e in merged)
+
+    summary: dict[str, Any] = {
+        "captions_count": len(captions),
+        "silence_cuts": [
+            {"start_seconds": s / US_PER_S, "end_seconds": e / US_PER_S}
+            for s, e in silence_cuts
+        ],
+        "duplicate_cuts": [
+            {"start_seconds": s / US_PER_S, "end_seconds": e / US_PER_S}
+            for s, e in duplicate_cuts
+        ],
+        "merged_ranges": [
+            {"start_seconds": s / US_PER_S, "end_seconds": e / US_PER_S}
+            for s, e in merged
+        ],
+        "total_cut_seconds": total_cut_us / US_PER_S,
+        "original_duration_seconds": duration_us / US_PER_S,
+        "dry_run": dry_run,
+    }
+
+    if not merged or dry_run:
+        summary["new_duration_seconds"] = duration_us / US_PER_S
+        return summary
+
+    cut_result = remove_time_ranges(
+        name, [(s / US_PER_S, e / US_PER_S) for s, e in merged]
+    )
+    summary["new_duration_seconds"] = cut_result["new_duration_seconds"]
+    return summary

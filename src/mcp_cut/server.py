@@ -470,6 +470,74 @@ def add_captions_from_srt(
 # ---- system ----------------------------------------------------------------
 
 @mcp.tool()
+def remove_time_ranges(
+    draft: str,
+    starts_seconds: list[float],
+    ends_seconds: list[float],
+) -> dict[str, Any]:
+    """Cut multiple time ranges out of the timeline across every track.
+
+    `starts_seconds` and `ends_seconds` are parallel arrays — each pair
+    `(starts_seconds[i], ends_seconds[i])` is one range to remove.
+    Overlapping ranges are merged. Segments crossing a cut are split.
+    Survivors shift left to close the gaps.
+
+    Use this to trim intros/outros, remove dead air, or splice out a
+    section the LLM identified.
+    """
+    if len(starts_seconds) != len(ends_seconds):
+        return {"error": "starts_seconds and ends_seconds must have the same length"}
+    ranges = list(zip(starts_seconds, ends_seconds))
+    return D.remove_time_ranges(name=draft, ranges_seconds=ranges)
+
+
+@mcp.tool()
+def get_auto_captions(draft: str) -> dict[str, Any]:
+    """Read CapCut's auto-generated captions out of a draft.
+
+    Detects text materials with `recognize_task_id` (set by CapCut when the
+    user runs "Text → Auto Captions"). Returns timeline-sorted captions
+    with per-word timings already converted to absolute seconds.
+
+    Returns `{captions: []}` if the draft has no auto-captions yet.
+    """
+    captions = D.get_auto_captions(name=draft)
+    return {"count": len(captions), "captions": captions}
+
+
+@mcp.tool()
+def smart_cut_draft(
+    draft: str,
+    silence_threshold_seconds: float = 1.0,
+    duplicate_similarity_threshold: float = 0.6,
+    cut_silences: bool = True,
+    cut_duplicates: bool = True,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Heuristic auto-edit for talking-head drafts.
+
+    Reads CapCut auto-captions and removes:
+      * silences (subtitle gaps > `silence_threshold_seconds`)
+      * duplicate takes (when the speaker re-recorded a phrase, the
+        latest version is kept — earlier attempts are cut)
+
+    Pass `dry_run=True` to preview the cuts without modifying the draft.
+
+    Prerequisite: the draft must have auto-captions. Open it in CapCut,
+    run "Text → Auto Captions", save, close, then call this. CapCut
+    caches the draft when open, so close+reopen after the cut.
+    """
+    return D.smart_cut_draft(
+        name=draft,
+        silence_threshold_seconds=silence_threshold_seconds,
+        duplicate_similarity_threshold=duplicate_similarity_threshold,
+        cut_silences=cut_silences,
+        cut_duplicates=cut_duplicates,
+        dry_run=dry_run,
+    )
+
+
+@mcp.tool()
 def open_in_capcut(draft: str | None = None) -> dict[str, Any]:
     """Launch the CapCut macOS app. Drafts in the projects folder will appear
     in the Drafts list (you may need to switch tabs to refresh).

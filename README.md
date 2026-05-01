@@ -60,11 +60,14 @@ add_captions_from_srt(draft="my-video", srt_path="/path/to/whisper.srt", style="
 open_in_capcut(draft="my-video")
 ```
 
-## Tools (21)
+## Tools (24)
 
-CapCut drafts live at
-`~/Movies/CapCut/User Data/Projects/com.lveditor.draft/<name>/`. Tools
-read and write that folder.
+CapCut drafts live at:
+- macOS: `~/Movies/CapCut/User Data/Projects/com.lveditor.draft/<name>/`
+- Windows: `%LOCALAPPDATA%\CapCut\User Data\Projects\com.lveditor.draft\<name>\`
+- Linux (best effort): `~/.local/share/CapCut/drafts/<name>/`
+
+Override via `CAPCUT_DRAFTS_DIR` env var if your install is elsewhere.
 
 All media-accepting tools (`add_image`, `add_video`, `add_audio`,
 `add_image_sequence`, `probe_media`) accept either a local path **or** an
@@ -117,6 +120,7 @@ full length; `add_image` auto-detects pixel dimensions.
 | `delete_segment(draft, segment_id)` | Remove one segment |
 | `clear_track(draft, track_type, track_index=0)` | Empty one track + GC orphan materials |
 | `clear_text_tracks(draft)` | Empty every text track + GC — use to re-run captions cleanly |
+| `remove_time_ranges(draft, starts_seconds, ends_seconds)` | Cut multiple time ranges out of the timeline; survivors shift left to close the gaps. Splits segments that span a cut |
 
 ### Animation
 
@@ -124,6 +128,13 @@ full length; `add_image` auto-detects pixel dimensions.
 |---|---|
 | `add_keyframe(draft, segment_id, time_seconds, property, value, curve="Line")` | Animate `x`, `y`, `scale_x`, `scale_y`, `rotation`, `alpha`, or `volume` over time. Two+ keyframes on the same property → CapCut interpolates |
 | `add_keyframes(draft, segment_id, property, times_seconds, values, curve="Line")` | Batch version — set N keyframes on one property in a single call (parallel arrays of times + values) |
+
+### Smart editing (talking-head workflows)
+
+| Tool | Purpose |
+|---|---|
+| `get_auto_captions(draft)` | Read CapCut's auto-generated captions back out of a draft (text + per-word timings). Detects materials with `recognize_task_id` set by CapCut's "Text → Auto Captions" |
+| `smart_cut_draft(draft, silence_threshold_seconds=1.0, duplicate_similarity_threshold=0.6, cut_silences=True, cut_duplicates=True, dry_run=False)` | Auto-edit using auto-captions: removes silences (gaps > threshold) and duplicate takes (keeps the last version of repeated phrases). Heuristic ported from [sun-guannan/capcut-ai-editor](https://github.com/sun-guannan/capcut-ai-editor) |
 
 ### System
 
@@ -232,6 +243,17 @@ sound_channel_mapping, vocal_separation).
 
 `new_version: "167.0.0"` corresponds to CapCut 8.5; older versions of
 CapCut may upgrade-on-open or refuse the file.
+
+### Schema notes
+
+A few non-obvious things confirmed against real CapCut drafts that may
+matter if you extend the schema:
+
+- Most time fields are **microseconds**, but `materials.texts[].words.{start_time, end_time}` are **milliseconds** relative to the segment start. `get_auto_captions` converts these to absolute seconds for you.
+- Auto-generated subtitles have `recognize_task_id != ""` on the text material; manually-added text leaves it empty.
+- Text segments use `render_index: 14000` and `track_render_index: <position in tracks[]>`. Video segments use `render_index: 0`.
+- Each text segment must reference exactly one `material_animations` entry of `type: "sticker_animation"` (else CapCut silently drops the text).
+- `font_path` is required and must point to an existing TTF/OTF — empty string makes the text invisible. CapCut's bundled fonts live in `/Applications/CapCut.app/Contents/Resources/Font/SystemFont/`.
 
 ## License
 
