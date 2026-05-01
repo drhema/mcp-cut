@@ -564,9 +564,22 @@ def _empty_track(type_: str) -> dict[str, Any]:
     }
 
 
+def _canvas_ratio(width: int, height: int) -> str:
+    aspect = width / height if height else 0
+    if abs(aspect - (16 / 9)) < 0.01:
+        return "16:9"
+    if abs(aspect - (9 / 16)) < 0.01:
+        return "9:16"
+    if abs(aspect - (4 / 3)) < 0.01:
+        return "4:3"
+    if abs(aspect - 1.0) < 0.01:
+        return "1:1"
+    return "original"
+
+
 def _empty_draft_info(width: int, height: int, fps: float) -> dict[str, Any]:
     return {
-        "canvas_config": {"background": None, "height": height, "ratio": "original", "width": width},
+        "canvas_config": {"background": None, "height": height, "ratio": _canvas_ratio(width, height), "width": width},
         "color_space": 0,
         "config": {
             "adjust_max_index": 1, "attachment_info": [],
