@@ -700,6 +700,67 @@ def _save(folder: Path, info: dict[str, Any], meta: dict[str, Any]) -> None:
     _bump_modified(meta, info)
     _write_json(_info_path(folder), info)
     _write_json(_meta_path(folder), meta)
+    _sync_recovery_files(folder, info)
+
+
+def _sync_recovery_files(folder: Path, info: dict[str, Any]) -> None:
+    """CapCut keeps multiple stale-state stashes that it can fall back to
+    when reopening a project, and a sentinel marking the project as "open".
+    Without syncing these, CapCut silently reverts our edits.
+
+    State files we touch:
+      * `draft_info.json.bak` (per-project backup) — overwrite with current
+      * `template-2.tmp`      (per-project template snapshot) — overwrite
+      * `.locked`             (sentinel) — delete
+      * `<root>/root_meta_info.json` (gallery cache shared by all drafts) —
+        update this draft's tm_duration / tm_draft_modified
+    """
+    info_path = _info_path(folder)
+    meta_path = _meta_path(folder)
+    if not info_path.exists():
+        return
+    payload = info_path.read_bytes()
+    for name in ("draft_info.json.bak", "template-2.tmp"):
+        target = folder / name
+        if target.exists():
+            target.write_bytes(payload)
+    locked = folder / ".locked"
+    if locked.exists():
+        try:
+            locked.unlink()
+        except OSError:
+            pass
+
+    # Update the gallery cache so CapCut Home shows the new duration and
+    # so CapCut doesn't fall back to the cached old timeline length.
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return
+    name = meta.get("draft_name")
+    if not name:
+        return
+    root_cache = folder.parent / "root_meta_info.json"
+    if not root_cache.exists():
+        return
+    try:
+        cache = json.loads(root_cache.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return
+    changed = False
+    for entry in cache.get("all_draft_store", []) or []:
+        if entry.get("draft_name") == name:
+            entry["tm_duration"] = meta.get("tm_duration", entry.get("tm_duration", 0))
+            entry["tm_draft_modified"] = meta.get(
+                "tm_draft_modified", entry.get("tm_draft_modified", 0),
+            )
+            entry["tm_duration_milli"] = entry["tm_duration"] // 1000
+            changed = True
+            break
+    if changed:
+        root_cache.write_text(
+            json.dumps(cache, separators=(",", ":")), encoding="utf-8",
+        )
 
 
 def _bump_modified(meta: dict[str, Any], info: dict[str, Any]) -> None:
