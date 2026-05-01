@@ -10,6 +10,7 @@ build/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+tmp/
 .idea/
 .vscode/
 *.swp

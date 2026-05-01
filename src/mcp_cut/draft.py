@@ -43,6 +43,7 @@ def _now_us() -> int:
 # Cache for downloaded URLs. Keyed by SHA-256 of the URL so the same URL
 # resolves to the same local file across runs and across drafts.
 _DOWNLOAD_CACHE = Path.home() / ".cache" / "mcp-cut" / "downloads"
+_DRAFT_MEDIA_DIR = "mcp_cut_media"
 
 
 def _is_url(path: str) -> bool:
@@ -104,6 +105,34 @@ def _resolve_media_path(path: str) -> str:
     if not Path(abs_path).exists():
         raise DraftError(f"file not found: {abs_path}")
     return abs_path
+
+
+def _stage_media_for_draft(folder: Path, path: str) -> str:
+    """Copy source media into the draft package and return that local path.
+
+    CapCut on macOS may not be able to read arbitrary absolute paths from a
+    generated draft because those files were never selected/imported through
+    the app. Files inside the draft folder are part of CapCut's own project
+    storage and survive moves/deletes of the original source media.
+    """
+    src = Path(path).expanduser().resolve()
+    folder = folder.resolve()
+    if src == folder or folder in src.parents:
+        return str(src)
+
+    media_dir = folder / _DRAFT_MEDIA_DIR
+    media_dir.mkdir(parents=True, exist_ok=True)
+
+    target = media_dir / src.name
+    if target.exists() and target.stat().st_size != src.stat().st_size:
+        suffix = src.suffix
+        stem = src.name[:-len(suffix)] if suffix else src.name
+        digest = hashlib.sha256(str(src).encode("utf-8")).hexdigest()[:8]
+        target = media_dir / f"{stem}-{digest}{suffix}"
+
+    if not target.exists() or target.stat().st_size != src.stat().st_size:
+        shutil.copy2(src, target)
+    return str(target)
 
 
 def _ffprobe_available() -> bool:
@@ -931,6 +960,7 @@ def _add_visual(
         height = 1080
 
     folder, info, meta = _load(name)
+    draft_path = _stage_media_for_draft(folder, abs_path)
 
     target_dur = int(duration_seconds * US_PER_S)
     source_start = int(source_start_seconds * US_PER_S)
@@ -938,7 +968,7 @@ def _add_visual(
     mat_dur = PHOTO_LONG_DURATION_US if media_type == "photo" else max(target_dur + source_start, target_dur)
     mat = _make_visual_material(
         media_type=media_type,
-        path=abs_path,
+        path=draft_path,
         duration_us=mat_dur,
         width=width,
         height=height,
@@ -979,6 +1009,7 @@ def _add_visual(
         "track_index": track_index,
         "start_seconds": target_start / US_PER_S,
         "duration_seconds": target_dur / US_PER_S,
+        "path": draft_path,
     }
 
 
@@ -1081,10 +1112,11 @@ def add_audio(
         duration_seconds = probe_media(abs_path)["duration_seconds"]
 
     folder, info, meta = _load(name)
+    draft_path = _stage_media_for_draft(folder, abs_path)
 
     target_dur = int(duration_seconds * US_PER_S)
     source_start = int(source_start_seconds * US_PER_S)
-    mat = _make_audio_material(abs_path, target_dur + source_start)
+    mat = _make_audio_material(draft_path, target_dur + source_start)
     info["materials"]["audios"].append(mat)
 
     speed = _make_speed()
@@ -1118,6 +1150,7 @@ def add_audio(
         "track_index": track_index,
         "start_seconds": target_start / US_PER_S,
         "duration_seconds": target_dur / US_PER_S,
+        "path": draft_path,
     }
 
 

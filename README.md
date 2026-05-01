@@ -74,6 +74,11 @@ All media-accepting tools (`add_image`, `add_video`, `add_audio`,
 `http(s)://` URL. URLs are downloaded into `~/.cache/mcp-cut/downloads/`
 and reused across runs (cache key = SHA-256 of the URL).
 
+When a media file is added to a draft, `mcp-cut` copies it into
+`<draft>/mcp_cut_media/` and stores that staged path in the CapCut schema.
+This avoids macOS sandbox/security-scoped access problems when CapCut opens a
+programmatically generated draft that references arbitrary external files.
+
 When `ffprobe` is available, missing dimensions/durations are auto-probed
 — `add_video(video_path=..., duration_seconds=None)` uses the source's
 full length; `add_image` auto-detects pixel dimensions.
