@@ -6,10 +6,14 @@ draft new_version 151.0.0, version 360000). Time units are microseconds.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
+import subprocess
 import time
+import urllib.parse
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -30,6 +34,177 @@ def _uuid() -> str:
 
 def _now_us() -> int:
     return int(time.time() * US_PER_S)
+
+
+# ---- media path resolution & probing ---------------------------------------
+
+# Cache for downloaded URLs. Keyed by SHA-256 of the URL so the same URL
+# resolves to the same local file across runs and across drafts.
+_DOWNLOAD_CACHE = Path.home() / ".cache" / "mcp-cut" / "downloads"
+
+
+def _is_url(path: str) -> bool:
+    return path.startswith(("http://", "https://"))
+
+
+def _ext_from_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    suffix = Path(parsed.path).suffix.lower()
+    return suffix if suffix and len(suffix) <= 8 else ""
+
+
+def _download_url(url: str, *, timeout: float = 60.0) -> str:
+    """Download `url` into the on-disk cache and return the local path.
+
+    Cache hits skip the download. The cache key is sha256(url) so the same
+    URL across runs/drafts deduplicates to one file.
+    """
+    _DOWNLOAD_CACHE.mkdir(parents=True, exist_ok=True)
+    h = hashlib.sha256(url.encode("utf-8")).hexdigest()[:32]
+    ext = _ext_from_url(url)
+    target = _DOWNLOAD_CACHE / f"{h}{ext}"
+    if target.exists() and target.stat().st_size > 0:
+        return str(target)
+    # CDNs (notably Wikimedia) reject bare/generic UAs. Use a browser-like
+    # string with a project identifier so we're polite *and* allowed.
+    req = urllib.request.Request(url, headers={
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 "
+            "(KHTML, like Gecko) mcp-cut/0.1 (+https://github.com/drhema/mcp-cut)"
+        ),
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        # If we couldn't infer an ext from the URL path, try the response.
+        if not ext:
+            ctype = resp.headers.get("Content-Type", "").split(";")[0].strip()
+            ctype_ext = {
+                "image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
+                "image/gif": ".gif", "image/webp": ".webp",
+                "video/mp4": ".mp4", "video/quicktime": ".mov",
+                "video/webm": ".webm",
+                "audio/mpeg": ".mp3", "audio/mp3": ".mp3",
+                "audio/mp4": ".m4a", "audio/wav": ".wav", "audio/x-wav": ".wav",
+            }.get(ctype, "")
+            if ctype_ext:
+                target = _DOWNLOAD_CACHE / f"{h}{ctype_ext}"
+        with open(target, "wb") as f:
+            shutil.copyfileobj(resp, f)
+    return str(target)
+
+
+def _resolve_media_path(path: str) -> str:
+    """Accept a local path or an http(s) URL. Returns an absolute local
+    path on disk; downloads into the cache when given a URL.
+    """
+    if _is_url(path):
+        return _download_url(path)
+    abs_path = str(Path(path).expanduser().resolve())
+    if not Path(abs_path).exists():
+        raise DraftError(f"file not found: {abs_path}")
+    return abs_path
+
+
+def _ffprobe_available() -> bool:
+    return shutil.which("ffprobe") is not None
+
+
+def _parse_fps(rate: str | None) -> float | None:
+    """ffprobe r_frame_rate looks like '30000/1001' or '30/1'."""
+    if not rate or rate == "0/0":
+        return None
+    if "/" in rate:
+        a, b = rate.split("/", 1)
+        try:
+            num, den = float(a), float(b)
+            return num / den if den else None
+        except ValueError:
+            return None
+    try:
+        return float(rate)
+    except ValueError:
+        return None
+
+
+def probe_media(path: str) -> dict[str, Any]:
+    """Run ffprobe on a local path or URL; report duration / dimensions / fps.
+
+    Result shape:
+        {
+          "path": <resolved local path>,
+          "duration_seconds": float,    # always present
+          "width": int | None,
+          "height": int | None,
+          "fps": float | None,
+          "has_video": bool,
+          "has_audio": bool,
+          "media_type": "video" | "audio" | "image",
+        }
+    """
+    if not _ffprobe_available():
+        raise DraftError(
+            "ffprobe not found in PATH. Install with `brew install ffmpeg` "
+            "or pass duration / width / height manually."
+        )
+    local = _resolve_media_path(path)
+    cmd = [
+        "ffprobe", "-v", "error", "-print_format", "json",
+        "-show_format", "-show_streams", local,
+    ]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=30)
+    except subprocess.CalledProcessError as e:
+        raise DraftError(f"ffprobe failed for {local}: {e.output.decode()[:200]}")
+    data = json.loads(out)
+
+    streams = data.get("streams", [])
+    fmt = data.get("format", {})
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+
+    width = video.get("width") if video else None
+    height = video.get("height") if video else None
+    fps = _parse_fps(video.get("r_frame_rate")) if video else None
+
+    duration_s = 0.0
+    if "duration" in fmt:
+        try:
+            duration_s = float(fmt["duration"])
+        except (TypeError, ValueError):
+            duration_s = 0.0
+
+    # Codecs that ffprobe reports as a "video" stream but are actually
+    # single-frame stills (album cover art, image files).
+    STILL_CODECS = {"png", "mjpeg", "webp", "gif", "bmp", "tiff", "heif"}
+    video_is_still = bool(video) and video.get("codec_name", "") in STILL_CODECS
+
+    if video and not audio:
+        media_type = "image" if (video_is_still or duration_s == 0.0) else "video"
+    elif video and audio:
+        # MP3/M4A with embedded cover art: a still video stream + an audio
+        # stream. Classify as audio so duration_seconds and add_audio work.
+        media_type = "audio" if video_is_still else "video"
+    elif audio:
+        media_type = "audio"
+    else:
+        media_type = "video"
+
+    # For audio-with-cover-art, drop the misleading width/height/fps from
+    # the report — they describe the cover art, not the audio.
+    if media_type == "audio" and video_is_still:
+        width = None
+        height = None
+        fps = None
+
+    return {
+        "path": local,
+        "duration_seconds": duration_s,
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "has_video": video is not None,
+        "has_audio": audio is not None,
+        "media_type": media_type,
+    }
 
 
 # ---- platform block ---------------------------------------------------------
@@ -658,17 +833,39 @@ def _add_visual(
     name: str,
     path: str,
     media_type: str,
-    duration_seconds: float,
+    duration_seconds: float | None,
     source_start_seconds: float,
     has_audio: bool,
-    width: int,
-    height: int,
+    width: int | None,
+    height: int | None,
     start_seconds: float | None,
     track_index: int,
 ) -> dict[str, Any]:
-    abs_path = str(Path(path).expanduser().resolve())
-    if not Path(abs_path).exists():
-        raise DraftError(f"File not found: {abs_path}")
+    abs_path = _resolve_media_path(path)
+
+    # Probe if any required field is missing. Photos must always have a
+    # caller-supplied duration_seconds (probe returns 0 for stills).
+    needs_probe = (
+        (duration_seconds is None and media_type != "photo")
+        or width is None or height is None
+    )
+    if needs_probe and _ffprobe_available():
+        probed = probe_media(abs_path)
+        if duration_seconds is None and media_type != "photo":
+            duration_seconds = probed["duration_seconds"]
+        if width is None:
+            width = probed["width"]
+        if height is None:
+            height = probed["height"]
+    if duration_seconds is None:
+        raise DraftError(
+            f"duration_seconds is required for {media_type} (probe failed "
+            f"or ffprobe unavailable). Pass it explicitly."
+        )
+    if width is None:
+        width = 1920
+    if height is None:
+        height = 1080
 
     folder, info, meta = _load(name)
 
@@ -726,11 +923,14 @@ def add_image(
     name: str,
     image_path: str,
     duration_seconds: float,
-    width: int = 1920,
-    height: int = 1080,
+    width: int | None = None,
+    height: int | None = None,
     start_seconds: float | None = None,
     track_index: int = 0,
 ) -> dict[str, Any]:
+    """`image_path` accepts http(s):// URLs (auto-downloaded into the cache)
+    or local paths. Width/height are auto-probed via ffprobe when None.
+    """
     return _add_visual(
         name=name, path=image_path, media_type="photo",
         duration_seconds=duration_seconds, source_start_seconds=0.0,
@@ -742,14 +942,17 @@ def add_image(
 def add_video(
     name: str,
     video_path: str,
-    duration_seconds: float,
-    width: int,
-    height: int,
+    duration_seconds: float | None = None,
+    width: int | None = None,
+    height: int | None = None,
     source_start_seconds: float = 0.0,
     has_audio: bool = True,
     start_seconds: float | None = None,
     track_index: int = 0,
 ) -> dict[str, Any]:
+    """`video_path` accepts http(s):// URLs (auto-downloaded) or local
+    paths. Duration / width / height are probed via ffprobe when None.
+    """
     return _add_visual(
         name=name, path=video_path, media_type="video",
         duration_seconds=duration_seconds,
@@ -765,8 +968,8 @@ def add_image_sequence(
     frame_seconds: float = 0.1,
     start_seconds: float | None = None,
     track_index: int = 0,
-    width: int = 1920,
-    height: int = 1080,
+    width: int | None = None,
+    height: int | None = None,
 ) -> dict[str, Any]:
     """Append images one after another at `frame_seconds` each — the
     frame-by-frame cartoon technique from method.md (default 0.1s = 10fps)."""
@@ -797,14 +1000,22 @@ def add_image_sequence(
 def add_audio(
     name: str,
     audio_path: str,
-    duration_seconds: float,
+    duration_seconds: float | None = None,
     start_seconds: float = 0.0,
     source_start_seconds: float = 0.0,
     track_index: int = 0,
 ) -> dict[str, Any]:
-    abs_path = str(Path(audio_path).expanduser().resolve())
-    if not Path(abs_path).exists():
-        raise DraftError(f"Audio file not found: {abs_path}")
+    """`audio_path` accepts http(s):// URLs (auto-downloaded) or local
+    paths. `duration_seconds=None` probes ffprobe for the source length.
+    """
+    abs_path = _resolve_media_path(audio_path)
+    if duration_seconds is None:
+        if not _ffprobe_available():
+            raise DraftError(
+                "duration_seconds=None requires ffprobe. "
+                "Install with `brew install ffmpeg` or pass duration explicitly."
+            )
+        duration_seconds = probe_media(abs_path)["duration_seconds"]
 
     folder, info, meta = _load(name)
 
@@ -1090,6 +1301,44 @@ def add_keyframe(
         "time_seconds": time_seconds,
         "value": value,
         "keyframe_id": kf["id"],
+    }
+
+
+def add_keyframes(
+    name: str,
+    segment_id: str,
+    property: str,
+    times_seconds: list[float],
+    values: list[float],
+    curve: str = "Line",
+) -> dict[str, Any]:
+    """Add multiple keyframes to one property in a single call.
+
+    `times_seconds` and `values` must be the same length. Times are
+    absolute timeline seconds (converted internally to segment-relative).
+    """
+    if len(times_seconds) != len(values):
+        raise DraftError(
+            f"length mismatch: {len(times_seconds)} times vs {len(values)} values"
+        )
+    if not times_seconds:
+        raise DraftError("times_seconds is empty")
+    if property not in KEYFRAME_PROPERTY_MAP:
+        raise DraftError(f"property must be one of {sorted(KEYFRAME_PROPERTY_MAP)}")
+
+    keyframe_ids: list[str] = []
+    for t, v in zip(times_seconds, values):
+        r = add_keyframe(
+            name=name, segment_id=segment_id,
+            time_seconds=float(t), property=property,
+            value=float(v), curve=curve,
+        )
+        keyframe_ids.append(r["keyframe_id"])
+    return {
+        "segment_id": segment_id,
+        "property": property,
+        "keyframe_count": len(keyframe_ids),
+        "keyframe_ids": keyframe_ids,
     }
 
 

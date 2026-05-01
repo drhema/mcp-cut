@@ -60,11 +60,20 @@ add_captions_from_srt(draft="my-video", srt_path="/path/to/whisper.srt", style="
 open_in_capcut(draft="my-video")
 ```
 
-## Tools (19)
+## Tools (21)
 
 CapCut drafts live at
 `~/Movies/CapCut/User Data/Projects/com.lveditor.draft/<name>/`. Tools
 read and write that folder.
+
+All media-accepting tools (`add_image`, `add_video`, `add_audio`,
+`add_image_sequence`, `probe_media`) accept either a local path **or** an
+`http(s)://` URL. URLs are downloaded into `~/.cache/mcp-cut/downloads/`
+and reused across runs (cache key = SHA-256 of the URL).
+
+When `ffprobe` is available, missing dimensions/durations are auto-probed
+— `add_video(video_path=..., duration_seconds=None)` uses the source's
+full length; `add_image` auto-detects pixel dimensions.
 
 ### Draft lifecycle
 
@@ -74,6 +83,7 @@ read and write that folder.
 | `inspect_draft(draft)` | Tracks + segment IDs + transforms for one draft |
 | `create_draft(name, width=1080, height=1920, fps=30)` | Empty portrait draft by default |
 | `delete_draft(draft)` | Recursively remove the draft folder |
+| `probe_media(path)` | ffprobe wrapper: returns duration / dimensions / fps for a local path or URL |
 
 ### Visual content
 
@@ -113,6 +123,7 @@ read and write that folder.
 | Tool | Purpose |
 |---|---|
 | `add_keyframe(draft, segment_id, time_seconds, property, value, curve="Line")` | Animate `x`, `y`, `scale_x`, `scale_y`, `rotation`, `alpha`, or `volume` over time. Two+ keyframes on the same property → CapCut interpolates |
+| `add_keyframes(draft, segment_id, property, times_seconds, values, curve="Line")` | Batch version — set N keyframes on one property in a single call (parallel arrays of times + values) |
 
 ### System
 

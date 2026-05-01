@@ -58,6 +58,19 @@ def delete_draft(draft: str) -> dict[str, Any]:
     return D.delete_draft(draft)
 
 
+@mcp.tool()
+def probe_media(path: str) -> dict[str, Any]:
+    """Probe a media file with ffprobe; report duration / width / height /
+    fps / streams. Accepts a local path OR an http(s):// URL (which gets
+    downloaded into the cache first).
+
+    Useful for callers that want to inspect a clip before adding it, or to
+    pass exact dimensions / duration into add_image / add_video / add_audio.
+    Requires ffprobe (install with `brew install ffmpeg` on macOS).
+    """
+    return D.probe_media(path)
+
+
 # ---- visual content --------------------------------------------------------
 
 @mcp.tool()
@@ -65,8 +78,8 @@ def add_image(
     draft: str,
     image_path: str,
     duration_seconds: float,
-    width: int = 1920,
-    height: int = 1080,
+    width: int | None = None,
+    height: int | None = None,
     start_seconds: float | None = None,
     track_index: int = 0,
 ) -> dict[str, Any]:
@@ -74,11 +87,13 @@ def add_image(
 
     Args:
         draft: draft name.
-        image_path: absolute or ~-relative path to PNG/JPG.
-        duration_seconds: how long the image displays.
-        width / height: source pixel dimensions (used by CapCut for scale).
-        start_seconds: timeline placement; None = append after last segment on this track.
-        track_index: 0 = base video track, 1+ = overlay tracks (created on demand).
+        image_path: local path OR http(s):// URL (auto-downloaded into the
+            cache at ~/.cache/mcp-cut/downloads/).
+        duration_seconds: how long the image displays (required for stills).
+        width / height: source pixel dimensions; auto-probed via ffprobe
+            when None (falls back to 1920×1080 if ffprobe missing).
+        start_seconds: timeline placement; None = append after last segment.
+        track_index: 0 = base video track, 1+ = overlay tracks.
     """
     return D.add_image(
         name=draft, image_path=image_path,
@@ -92,9 +107,9 @@ def add_image(
 def add_video(
     draft: str,
     video_path: str,
-    duration_seconds: float,
-    width: int,
-    height: int,
+    duration_seconds: float | None = None,
+    width: int | None = None,
+    height: int | None = None,
     source_start_seconds: float = 0.0,
     has_audio: bool = True,
     start_seconds: float | None = None,
@@ -104,11 +119,12 @@ def add_video(
 
     Args:
         draft: draft name.
-        video_path: absolute or ~-relative path to MP4/MOV.
-        duration_seconds: timeline duration of the clip (after trimming).
-        width / height: source pixel dimensions of the file.
+        video_path: local path OR http(s):// URL (auto-downloaded).
+        duration_seconds: timeline duration; None = full source length
+            (auto-probed via ffprobe).
+        width / height: source dimensions; None = auto-probed.
         source_start_seconds: trim head — offset into the source.
-        has_audio: set False to mute / for silent video.
+        has_audio: set False to mute the embedded audio.
         start_seconds: timeline placement; None = append on this track.
         track_index: 0 = base video track, 1+ = overlays.
     """
@@ -152,7 +168,7 @@ def add_image_sequence(
 def add_audio(
     draft: str,
     audio_path: str,
-    duration_seconds: float,
+    duration_seconds: float | None = None,
     start_seconds: float = 0.0,
     source_start_seconds: float = 0.0,
     track_index: int = 0,
@@ -161,8 +177,9 @@ def add_audio(
 
     Args:
         draft: draft name.
-        audio_path: absolute or ~-relative path to MP3/WAV/M4A.
-        duration_seconds: portion of the source to use.
+        audio_path: local path OR http(s):// URL (auto-downloaded).
+        duration_seconds: portion of the source to use; None = full
+            source length (auto-probed via ffprobe).
         start_seconds: timeline placement (default 0).
         source_start_seconds: trim head — offset into the source.
         track_index: 0 = base audio track, 1+ = additional audio layers.
@@ -296,6 +313,33 @@ def add_keyframe(
         name=draft, segment_id=segment_id,
         time_seconds=time_seconds,
         property=property, value=value, curve=curve,
+    )
+
+
+@mcp.tool()
+def add_keyframes(
+    draft: str,
+    segment_id: str,
+    property: str,
+    times_seconds: list[float],
+    values: list[float],
+    curve: str = "Line",
+) -> dict[str, Any]:
+    """Batch version of add_keyframe — set multiple keyframes on one
+    property in a single call.
+
+    `times_seconds` and `values` must be the same length; each pair becomes
+    one keyframe. `property` is one of x, y, scale_x, scale_y, rotation,
+    alpha, volume.
+
+    Example — slide-in then exit on x:
+        add_keyframes(segment_id=..., property="x",
+                      times_seconds=[0.0, 0.5, 2.0, 2.5],
+                      values=[1.5, 0.0, 0.0, -1.5])
+    """
+    return D.add_keyframes(
+        name=draft, segment_id=segment_id, property=property,
+        times_seconds=times_seconds, values=values, curve=curve,
     )
 
 
