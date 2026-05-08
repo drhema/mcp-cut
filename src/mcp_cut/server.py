@@ -227,6 +227,28 @@ def set_clip_transform(
 
 
 @mcp.tool()
+def set_chroma_key(
+    draft: str,
+    segment_id: str,
+    color: str = "#00d800ff",
+    intensity: float = 0.2,
+    shadow: float = 0.0,
+    edge_smooth: float = 0.0,
+    spill: float = 0.0,
+) -> dict[str, Any]:
+    """Apply CapCut chroma key to a video/image segment.
+
+    Use for green-screen character MP4s. The default color matches the green
+    sampled by CapCut from the generated Omar test clip.
+    """
+    return D.set_chroma_key(
+        name=draft, segment_id=segment_id, color=color,
+        intensity=intensity, shadow=shadow, edge_smooth=edge_smooth,
+        spill=spill,
+    )
+
+
+@mcp.tool()
 def set_segment_volume(draft: str, segment_id: str, volume: float) -> dict[str, Any]:
     """Set volume on any segment (audio or video). 1.0 = unchanged, 0.0 = mute."""
     return D.set_segment_volume(name=draft, segment_id=segment_id, volume=volume)

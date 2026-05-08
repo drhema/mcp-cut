@@ -1212,6 +1212,65 @@ def set_clip_transform(
     return {"segment_id": segment_id, "clip": clip}
 
 
+def set_chroma_key(
+    name: str,
+    segment_id: str,
+    color: str = "#00d800ff",
+    intensity: float = 0.2,
+    shadow: float = 0.0,
+    edge_smooth: float = 0.0,
+    spill: float = 0.0,
+) -> dict[str, Any]:
+    """Apply CapCut's chroma key material to a video segment.
+
+    `color` is CapCut's RGBA hex string. For generated green-screen clips,
+    `#00d800ff` matches the color CapCut samples from H.264 green plates
+    more reliably than pure `#00ff00ff`.
+    """
+    folder, info, meta = _load(name)
+    seg = _find_segment(info, segment_id)
+    chromas = info["materials"].setdefault("chromas", [])
+
+    chroma = None
+    for ref in seg.get("extra_material_refs", []) or []:
+        chroma = next((item for item in chromas if item.get("id") == ref), None)
+        if chroma:
+            break
+
+    if chroma is None:
+        chroma = {
+            "id": _uuid(),
+            "type": "chroma",
+            "color": "",
+            "intensity_value": 0.2,
+            "shadow_value": 0.0,
+            "path": "/Applications/CapCut.app/Contents/Resources/Chroma2",
+            "resource_id": "",
+            "should_transfer_color": True,
+            "edge_smooth_value": 0.0,
+            "spill_value": 0.0,
+            "version": "v2",
+        }
+        chromas.append(chroma)
+        refs = seg.setdefault("extra_material_refs", [])
+        if chroma["id"] not in refs:
+            refs.insert(min(2, len(refs)), chroma["id"])
+
+    chroma["color"] = color
+    chroma["intensity_value"] = float(intensity)
+    chroma["shadow_value"] = float(shadow)
+    chroma["edge_smooth_value"] = float(edge_smooth)
+    chroma["spill_value"] = float(spill)
+    chroma["should_transfer_color"] = True
+    if not chroma.get("path"):
+        chroma["path"] = "/Applications/CapCut.app/Contents/Resources/Chroma2"
+    if not chroma.get("version"):
+        chroma["version"] = "v2"
+
+    _save(folder, info, meta)
+    return {"segment_id": segment_id, "chroma": chroma}
+
+
 def set_segment_volume(name: str, segment_id: str, volume: float) -> dict[str, Any]:
     """Set the volume on a video or audio segment (1.0 = unchanged)."""
     folder, info, meta = _load(name)
